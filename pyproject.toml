@@ -1,0 +1,10 @@
+[project]
+name = "marydworks-mcp"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: SolidWorks 실행 중 + ASSY-A 열림 전제"]
+addopts = "-m 'not live'"
+asyncio_mode = "auto"

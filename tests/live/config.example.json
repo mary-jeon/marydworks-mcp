@@ -1,0 +1,15 @@
+{
+  "assembly_path": "C:\\path\\to\\ASSY-A.SLDASM",
+  "part_path": "C:\\path\\to\\PART-105.SLDPRT",
+  "expect": {
+    "bom_rows": 10,
+    "bom_instances": 23,
+    "part_material": "STS 304",
+    "part_mass_kg": 26.02,
+    "part_bbox_x_mm": 2686,
+    "part_props": {"TITLE": "SQ PIPE-04", "SPEC": "100x100x3.2T"}
+  },
+  "rename_lab_dir": "C:\\path\\to\\rename_lab",
+  "rename_lab_target": "PART-105.SLDPRT",
+  "rename_lab_extra_part": "PART-101.SLDPRT"
+}
