@@ -33,7 +33,6 @@ class Journal:
         self._lock = threading.Lock()
         self._plans: dict[str, dict] = {}
         self._cs: dict[str, dict] = {}
-        self.mcp_owned: list[str] = []
         # change_set_id -> 살아 있는 COM 문서 객체들. 미저장 문서(경로 없음·제목 중복 가능)를 제목 대신 객체로 다시 찾기 위함.
         self.handles: dict[str, list] = {}
 
@@ -76,9 +75,12 @@ class Journal:
                           {"expected": plan["precondition"], "current": current_precondition})
         return plan
 
-    def mark_applied(self, plan_id, dirty_documents, files_created) -> str:
+    def mark_applied(self, plan_id, dirty_documents, files_created, dirty_ids: list[str] | None = None) -> str:
+        # dirty_documents는 제목(사람용). dirty_ids는 정규화 경로(기계용) — 같은 파일명이 두 폴더에 열려 있어도
+        # 계획에 없던 문서가 저장되지 않게 save()가 이것으로 대조한다.
         cs = {"change_set_id": uuid.uuid4().hex[:12], "plan_id": plan_id, "applied": time.time(),
-              "dirty_documents": dirty_documents, "files_created": files_created, "saved": []}
+              "dirty_documents": dirty_documents, "dirty_ids": list(dirty_ids or []),
+              "files_created": files_created, "saved": []}
         with self._lock:
             self._plans[plan_id]["status"] = "applied"
             self._plans[plan_id]["change_set_id"] = cs["change_set_id"]
@@ -117,8 +119,15 @@ class Journal:
 JOURNAL: Journal | None = None
 
 
+def default_root() -> Path:
+    """journal/ 위치. 기본은 저장소 안(gitignore)이지만 `git clean -xdf`가 _backup까지 지우므로
+    SW_MCP_JOURNAL_DIR 환경변수로 저장소 밖(예: %LOCALAPPDATA%\\marydworks-mcp)을 지정할 수 있다."""
+    env = os.environ.get("SW_MCP_JOURNAL_DIR")
+    return Path(env) if env else Path(__file__).resolve().parent.parent / "journal"
+
+
 def journal(root: Path | None = None) -> Journal:
     global JOURNAL
     if JOURNAL is None:
-        JOURNAL = Journal(root or Path(__file__).resolve().parent.parent / "journal")
+        JOURNAL = Journal(root or default_root())
     return JOURNAL

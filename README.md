@@ -1,6 +1,6 @@
 # marydworks-mcp — SolidWorks MCP Server for Claude (Model Context Protocol)
 
-**marydworks-mcp is an open-source MCP server that connects Claude Code, Cursor, Windsurf or any Model Context Protocol client to a running SolidWorks 2024 session.** It exposes 12 tools for reading parts, assemblies and BOMs, and for editing custom properties, renaming files, exporting STEP/PDF and generating drawings — every write goes through a dry-run → apply → save workflow, so nothing changes on disk without an explicit step.
+**marydworks-mcp is an open-source MCP server that connects Claude Code, Cursor, Windsurf or any Model Context Protocol client to a running SolidWorks 2024 session.** It exposes 13 tools for reading parts, assemblies and BOMs, and for editing custom properties, renaming files, deleting components, exporting STEP/PDF and generating drawings — every write goes through a dry-run → apply → save workflow, so nothing changes on disk without an explicit step.
 
 Keywords: SolidWorks MCP server · SolidWorks API automation · Claude SolidWorks · Model Context Protocol CAD · pywin32 SolidWorks · SolidWorks BOM extraction · SolidWorks custom properties automation · AI CAD assistant
 
@@ -10,8 +10,8 @@ Keywords: SolidWorks MCP server · SolidWorks API automation · Claude SolidWork
 
 - **What it is:** a Python MCP server (`mcp>=2`) that attaches to the SolidWorks COM API via pywin32.
 - **What it does:** read status / summary / BOM / audit / snapshot; write properties, save, export, rename, insert components, create drawings; optional headless instance.
-- **How it stays safe:** read-first tools, `dry_run=true` by default, precondition hashes (`PLAN_STALE`), backups before renames, no document open/close, no active-tab switching.
-- **Footprint:** 12 tools, about 7,000 characters of tool schema per session, one background COM thread.
+- **How it stays safe:** read-first tools, `dry_run=true` by default, precondition hashes (`PLAN_STALE`), backups before renames and overwrites, a save scope whitelist (`only_under`), deletions only from a listed plan, no document open/close.
+- **Footprint:** 13 tools, about 8,000 characters of tool schema per session, one background COM thread.
 - **Requirements:** Windows, SolidWorks 2024 (SP5 tested), Python 3.12, `pywin32`, `mcp>=2,<3`.
 
 ## Table of contents
@@ -34,10 +34,11 @@ Existing SolidWorks MCP projects tend to expose 30–40 tools and push 50,000+ c
 
 | | marydworks-mcp | Typical SolidWorks MCP |
 |---|---|---|
-| Tools | 12 | 30–40 |
+| Tools | 13 | 30–40 |
 | Tool schema per session | ~7 k chars | ~50 k chars |
 | Write model | dry-run → plan_id → apply → save | direct calls |
-| Backups before rename/overwrite | yes, with manifest | rarely |
+| Backups before rename/export-overwrite | yes, with manifest | rarely |
+| Deletes components without a listed plan | never | often |
 | Opens/closes user documents | never | often |
 | Switches active document on save/export | no | usually |
 | COM threading | one STA worker thread + named mutex | varies |
@@ -52,10 +53,11 @@ Existing SolidWorks MCP projects tend to expose 30–40 tools and push 50,000+ c
 | `sw_audit` | Missing properties, quantity mismatches, "copy"-named files, unassigned material, lightweight/suppressed components, optional interference check |
 | `sw_snapshot` | Isometric/front/top/right BMP captures; restores the view and the active document afterwards |
 | `sw_set_properties` | Custom-property edits with `$today`, `$instances`, `$expr:` helpers; preserves existing property types (dates stay dates) |
-| `sw_save` | Saves a change set in dependency order (parts → assemblies → drawings) or a single document; unsaved documents need `out_path` |
-| `sw_export` | STEP / STL / PNG for models, PDF / DXF for drawings; never overwrites unless asked; verifies size and hash |
+| `sw_save` | Saves a change set in dependency order (parts → assemblies → drawings) or a single document; unsaved documents need `out_path`; `only_under=[folders]` refuses to save anything outside them (shared libraries, other projects) |
+| `sw_export` | STEP / STL / PNG for models, PDF / DXF for drawings; never overwrites unless asked, and then only after copying the original to `_backup/`; verifies size and hash |
 | `sw_rename_document` | In-assembly `RenameDocument` with backup, reference update through `RenamedDocumentNotify`, optional property sync |
 | `sw_add_component` | Insert a part at `position_mm` with simple mates (coincident / concentric / distance), rollback on failure |
+| `sw_delete_components` | Delete top-level components of an assembly, chosen by `names[]` or `path_contains`; the dry run returns the **full target list** and a `plan_id`, apply needs that plan, and saving is a separate `sw_save` |
 | `sw_create_drawing` | Third-angle views + isometric + BOM table from a drawing template; save with `sw_save`, PDF with `sw_export` |
 | `sw_background` | Optional headless SolidWorks instance for batch jobs; refuses to start while any SolidWorks process is running |
 
@@ -96,11 +98,12 @@ Start SolidWorks, open a new Claude Code session and ask "is SolidWorks connecte
 2. Call the same tool with `dry_run=false, plan_id=...`. The server re-reads the current values; if they differ from the plan it returns `PLAN_STALE` instead of writing. On success it changes the model **in memory only** and returns a `change_set_id`.
 3. Call `sw_save(change_set_id)`. Documents are saved in dependency order. Until this step, Ctrl+Z in SolidWorks undoes everything.
 
-Renames and overwrites additionally copy the original files into `_backup/<timestamp>/` with a `manifest.json` (paths, SHA-256, related documents).
+Renames and export overwrites additionally copy the original files into `_backup/<timestamp>/` with a `manifest.json` (paths, SHA-256, related documents). Set `SW_MCP_JOURNAL_DIR` to keep `journal/` and `_backup/` outside the checkout.
 
 ## Safety notes
 
-- **Modal dialogs freeze COM.** If SolidWorks shows any dialog, every call blocks; the server returns `BUSY` after a bounded wait. Close the dialog and retry.
+- **Modal dialogs freeze COM.** If SolidWorks shows any dialog, every call blocks; the server returns `BUSY` after a bounded wait. A queued job that timed out is cancelled and never runs later; a job that had already started may still complete when SolidWorks responds. The error says which, so check `sw_status` before retrying a write.
+- **Deleting is a three-step action.** `sw_delete_components` lists every target in the dry run, deletes only from that plan, and never saves. Do not delete from ad-hoc COM scripts and save in the same breath. That is exactly how a path filter once removed functional parts from twelve assemblies.
 - **Run one SolidWorks instance.** A second (even empty) instance makes every COM call dramatically slower and can hijack the Running Object Table connection.
 - **Never `DispatchEx` into a running session.** `DispatchEx("SldWorks.Application")` returns the *existing* instance when one is running; calling `Visible=False`, `CloseAllDocuments` or `ExitApp` on it terminates the user's session. `sw_background` therefore refuses to start unless no SolidWorks process exists and verifies the new PID before touching anything.
 - **Date properties are typed.** Writing free text into a Date property leaves a ghost value that blocks re-adding the property; the server deletes and re-adds with the original type instead.
@@ -164,14 +167,14 @@ License: MIT.
 
 ### marydworks-mcp — Claude용 SolidWorks MCP 서버
 
-marydworks-mcp는 실행 중인 SolidWorks 2024 세션에 Claude Code·Cursor·Windsurf 같은 MCP(Model Context Protocol) 클라이언트를 연결하는 오픈소스 MCP 서버입니다. 파트·어셈블리·BOM을 읽는 도구와 사용자 속성 수정, 파일 이름 변경, STEP/PDF 내보내기, 도면 생성 도구 12개를 제공합니다. 쓰기 작업은 전부 dry-run → 적용 → 저장 순서를 거치므로 명시적인 단계 없이는 디스크의 파일이 바뀌지 않습니다.
+marydworks-mcp는 실행 중인 SolidWorks 2024 세션에 Claude Code·Cursor·Windsurf 같은 MCP(Model Context Protocol) 클라이언트를 연결하는 오픈소스 MCP 서버입니다. 파트·어셈블리·BOM을 읽는 도구와 사용자 속성 수정, 파일 이름 변경, 컴포넌트 삭제, STEP/PDF 내보내기, 도면 생성 도구 13개를 제공합니다. 쓰기 작업은 전부 dry-run → 적용 → 저장 순서를 거치므로 명시적인 단계 없이는 디스크의 파일이 바뀌지 않습니다.
 
 ### 한눈에 보기
 
 - **정체:** SolidWorks COM API에 pywin32로 붙는 Python MCP 서버(`mcp>=2`)
 - **기능:** 상태·요약·BOM·점검·스냅샷 읽기, 속성 변경·저장·내보내기·이름 변경·부품 삽입·도면 생성, 선택형 비가시 인스턴스
-- **안전장치:** 읽기 우선, 기본값 `dry_run=true`, 사전조건 해시(`PLAN_STALE`), 이름 변경 전 백업, 사용자 문서를 열거나 닫지 않음, 저장·내보내기 시 활성 탭을 바꾸지 않음
-- **크기:** 도구 12개, 세션당 도구 스키마 약 7,000자, 백그라운드 COM 스레드 1개
+- **안전장치:** 읽기 우선, 기본값 `dry_run=true`, 사전조건 해시(`PLAN_STALE`), 이름 변경·덮어쓰기 전 백업, 저장 범위 화이트리스트(`only_under`), 삭제는 전수 목록을 낸 plan으로만, 사용자 문서를 열거나 닫지 않음
+- **크기:** 도구 13개, 세션당 도구 스키마 약 8,000자, 백그라운드 COM 스레드 1개
 - **요구 사항:** Windows, SolidWorks 2024(SP5에서 확인), Python 3.12, `pywin32`, `mcp>=2,<3`
 
 ### 이런 일에 씁니다

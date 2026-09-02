@@ -10,7 +10,7 @@ Claude(및 다른 MCP 클라이언트)가 **실행 중인 SolidWorks**에 붙어
 원칙
 - **읽기 우선.** 쓰기는 항상 `dry_run` → `plan_id` → `apply` → `sw_save`의 4단계.
 - **붙기만 한다.** SolidWorks를 실행하지 않고, 사용자 문서를 열거나 닫지 않는다.
-- **가볍게.** 도구 11개, `tools/list` 설명+스키마 합계 ≤ 12,000자.
+- **가볍게.** 도구 13개, `tools/list` 설명+스키마 합계 ≤ 12,000자.
 - **오류는 프로토콜로.** 실패는 `ToolError`(`is_error=true`), 상태는 데이터 필드로.
 
 ## 2. 환경 확정
@@ -86,7 +86,7 @@ marydworks-mcp/
 
 plan·change_set은 메모리 + `journal/YYYYMMDD/*.json`. 백업은 `_backup/YYYYMMDD-HHMMSS/` + `manifest.json`(원본 경로·해시·관련 부모/참조 문서).
 
-## 4. 도구 11개
+## 4. 도구 13개
 
 공통 인자: `doc`(3.2). 쓰기 도구 공통: `dry_run=true`, `plan_id=None`.
 

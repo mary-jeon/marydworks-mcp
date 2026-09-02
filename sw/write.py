@@ -96,7 +96,7 @@ def set_properties(docs: list[DocSelector], scope: str, props: dict, assembly: O
     if not plan_id:
         raise SwError("PLAN_STALE", "dry_run=false에는 plan_id가 필요합니다")
     journal().check_plan(plan_id, "sw_set_properties", precondition)
-    dirty = []
+    dirty, dirty_ids = [], []
     for (m, info, cfg), d in zip(targets, per_doc):
         if not d["changes"]:
             continue
@@ -118,7 +118,8 @@ def set_properties(docs: list[DocSelector], scope: str, props: dict, assembly: O
             if rc != 0:
                 raise SwError("COM_ERROR", f"{info['title']} {c['name']} 설정 실패 rc={rc}")
         dirty.append(info["title"])
-    cs = journal().mark_applied(plan_id, dirty, [])
+        dirty_ids.append(info["document_id"])
+    cs = journal().mark_applied(plan_id, dirty, [], dirty_ids)
     return {"dry_run": False, "change_set_id": cs, "applied": per_doc, "dirty_documents": dirty, "warnings": all_warnings}
 
 
@@ -195,7 +196,58 @@ def save_model(app, m, out_path: Optional[str] = None, rename: Optional[dict] = 
     return result
 
 
-def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Optional[str], dry_run: bool) -> dict:
+def pick_change_set_docs(cs: dict, wanted: list[dict], open_docs: list[dict]) -> list[dict]:
+    """change_set이 가리키는 문서를 열린 문서 목록에서 고른다 (순수 함수 — 단위 테스트 대상).
+
+    핸들로 이미 채운 `wanted`는 그대로 두고, 나머지는 dirty_ids(정규화 경로)로 먼저 대조한다.
+    id가 없는 옛 change_set만 제목으로 대조하되, 같은 제목이 둘 이상 열려 있으면 고르지 않고 멈춘다 —
+    계획에 없던 다른 폴더의 동명 파일을 저장하는 사고를 막기 위해서다.
+    """
+    have_ids = {d["document_id"] for d in wanted}
+    have_titles = {d["title"] for d in wanted}
+    out = list(wanted)
+    for did in cs.get("dirty_ids") or []:
+        if did in have_ids:
+            continue
+        hits = [d for d in open_docs if d["document_id"] == did]
+        if hits:
+            out.append(hits[0])
+            have_ids.add(did)
+            have_titles.add(hits[0]["title"])
+    remaining = [t for t in cs["dirty_documents"] if t not in have_titles]
+    for t in remaining:
+        hits = [d for d in open_docs if d["title"] == t and d["document_id"] not in have_ids]
+        if len(hits) > 1:
+            raise SwError("DOC_AMBIGUOUS", f"같은 이름의 문서가 {len(hits)}개 열려 있어 어느 것을 저장할지 정할 수 없습니다: {t}",
+                          {"candidates": [h.get("path") for h in hits]})
+        if hits:
+            out.append(hits[0])
+            have_ids.add(hits[0]["document_id"])
+            have_titles.add(t)
+    missing = [t for t in cs["dirty_documents"] if t not in have_titles]
+    if missing:
+        raise SwError("DOC_NOT_FOUND", f"change_set의 문서가 열려 있지 않습니다: {sorted(missing)}")
+    return out
+
+
+def check_save_scope(docs: list[dict], only_under: list[str]) -> list[str]:
+    """only_under 밖의 문서 경로를 돌려준다 (순수 함수). 공용 라이브러리·타 프로젝트 문서가
+    저장 루프에 딸려 들어가는 사고를 막는 화이트리스트."""
+    if not only_under:
+        return []
+    roots = [normalize_path(r).rstrip("\\/") + os.sep for r in only_under]
+    outside = []
+    for d in docs:
+        p = d.get("path")
+        if not p:
+            continue  # 미저장 문서는 out_path로 별도 판정
+        if not any(normalize_path(p).startswith(r) for r in roots):
+            outside.append(p)
+    return outside
+
+
+def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Optional[str], dry_run: bool,
+         only_under: Optional[list[str]] = None) -> dict:
     app = api.get_app()
     rename = None
     if change_set_id:
@@ -210,15 +262,10 @@ def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Opt
                 d = api.doc_info(app, h, active_key)
                 d["_raw"] = h
                 wanted.append(d)
-        have_titles = {d["title"] for d in wanted}
-        remaining = [t for t in cs["dirty_documents"] if t not in have_titles]
-        if remaining:
-            # 핸들로 못 채운 문서만 전체 열거로 찾는다 (열거는 SolidWorks가 바쁠 때 1분 이상)
-            have = {d["document_id"] for d in wanted}
-            wanted += [d for d in api.list_docs(app, with_raw=True, light=True) if d["title"] in remaining and d["document_id"] not in have]
-        missing = set(cs["dirty_documents"]) - {d["title"] for d in wanted}
-        if missing:
-            raise SwError("DOC_NOT_FOUND", f"change_set의 문서가 열려 있지 않습니다: {sorted(missing)}")
+        need = [t for t in cs["dirty_documents"] if t not in {d["title"] for d in wanted}]
+        # 핸들로 못 채운 문서만 전체 열거로 찾는다 (열거는 SolidWorks가 바쁠 때 1분 이상)
+        open_docs = api.list_docs(app, with_raw=True, light=True) if need else []
+        wanted = pick_change_set_docs(cs, wanted, open_docs)
     elif doc is not None:
         if doc.path and not doc.active:
             m0, info0 = resolve(app, doc)  # 경로면 열거 없이 1회 호출
@@ -232,8 +279,15 @@ def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Opt
     unsaved = [d["title"] for d in ordered if not d["path"]]
     if unsaved and not out_path:
         raise SwError("FILE_EXISTS", "저장된 적 없는 문서는 out_path가 필요합니다: " + ", ".join(unsaved))
+    if len(unsaved) > 1 and out_path:
+        raise SwError("FILE_EXISTS", f"out_path 하나에 미저장 문서 {len(unsaved)}개를 저장할 수 없습니다 (뒤의 것이 앞의 것을 덮어씀): "
+                                     + ", ".join(unsaved) + " — 문서별로 sw_save(doc=..., out_path=...)")
     if out_path and os.path.exists(out_path):
         raise SwError("FILE_EXISTS", f"이미 존재: {out_path}")
+    outside = check_save_scope(ordered, only_under or [])
+    if outside:
+        raise SwError("FILE_EXISTS", f"only_under 밖의 문서 {len(outside)}개는 저장하지 않습니다 (공용 라이브러리·타 프로젝트 보호)",
+                      {"outside": outside, "only_under": only_under})
     if dry_run:
         return {"dry_run": True, "will_save": [{"title": d["title"], "path": d["path"] or out_path, "dirty": d["dirty"], "type": d["type"]} for d in ordered]}
     saved = []
@@ -269,6 +323,11 @@ def export(sel: DocSelector, fmt: str, out_path: str, overwrite: bool) -> dict:
     m, info = resolve(app, sel)
     export_check(info["type"], fmt, out_path, overwrite)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    backup_dir = None
+    if os.path.exists(out_path):
+        # overwrite=true여도 덮어쓰기 전 원본을 _backup/에 남긴다 (rename과 같은 규칙)
+        backup_dir = journal().backup([out_path], related=[info.get("path") or info["title"]],
+                                      reason=f"export overwrite {os.path.basename(out_path)}")["dir"]
     # 비활성 문서에서도 SaveAs3 내보내기가 된다(실측 확인) → 활성 탭을 건드리지 않는다.
     m.ClearSelection2(True)
     ext = api.cast("IModelDocExtension", m.Extension)
@@ -278,7 +337,8 @@ def export(sel: DocSelector, fmt: str, out_path: str, overwrite: bool) -> dict:
     if not ok or e or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
         raise SwError("COM_ERROR", f"내보내기 실패 또는 파일 미생성: {out_path} (errors={e})")
     data = open(out_path, "rb").read()
-    return {"path": out_path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "warnings_bits": int(warn.value or 0)}
+    return {"path": out_path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "warnings_bits": int(warn.value or 0),
+            "backup": backup_dir}
 
 
 # ---------------------------------------------------------------- rename
@@ -381,7 +441,7 @@ def rename_document(target: DocSelector, parent: DocSelector, new_name: str, upd
             synced[k] = v
     # 대상 파트는 이름이 이미 바뀌어 제목으로 다시 찾을 수 없다 → 부모 어셈블리를 핸들로 저장(SaveReferenced가 파트도 저장)
     dirty = [pinfo["title"]] + [r for r in open_refs if r not in (tinfo["title"], pinfo["title"])]
-    cs = journal().mark_applied(plan_id, dirty, [])
+    cs = journal().mark_applied(plan_id, dirty, [], [pinfo["document_id"]])
     journal().get_change_set(cs)["rename"] = {"update_unopened": update_unopened_references, "search_folders": search_folders or [folder]}
     journal().attach_handles(cs, [pm])
     return {"dry_run": False, "change_set_id": cs, "renamed_component": comp.Name2, "new_name": new_name,
@@ -469,9 +529,81 @@ def add_component(assembly: DocSelector, part_path: str, position_mm: list[float
         pm.EditDelete()
         raise SwError("COM_ERROR", f"{failed} — 컴포넌트 삭제(rollback)")
     ext.Rebuild(SW_REBUILD_ALL)
-    cs = journal().mark_applied(plan_id, [pinfo["title"]], [])
+    cs = journal().mark_applied(plan_id, [pinfo["title"]], [], [pinfo["document_id"]])
     return {"dry_run": False, "change_set_id": cs, "component": comp.Name2, "mates_added": added,
             "mate_failure": failed, "dirty_documents": [pinfo["title"]]}
+
+
+# ---------------------------------------------------------------- delete_components
+
+
+def select_delete_targets(children: list[dict], names: list[str], path_contains: Optional[str]) -> list[dict]:
+    """삭제 대상 고르기 (순수 함수). children = [{"name", "path"}]. names는 정확히 일치, path_contains는
+    정규화 경로 부분 문자열. 둘 다 없으면 아무것도 고르지 않는다 — '전부'는 선택지가 아니다."""
+    want = set(names or [])
+    sub = normalize_path(path_contains) if path_contains else None
+    out = []
+    for c in children:
+        by_name = c["name"] in want
+        by_path = bool(sub) and sub in normalize_path(c.get("path") or "")
+        if by_name or by_path:
+            out.append(c)
+    unknown = sorted(want - {c["name"] for c in children})
+    if unknown:
+        raise SwError("DOC_NOT_FOUND", f"어셈블리 직계 컴포넌트에 없는 이름: {unknown}")
+    return out
+
+
+def delete_components(assembly: DocSelector, names: list[str], path_contains: Optional[str],
+                      dry_run: bool, plan_id: Optional[str]) -> dict:
+    """어셈블리 직계 컴포넌트 삭제. 반드시 dry_run으로 전수 목록을 받은 뒤 plan_id로 적용. 저장은 sw_save.
+
+    실제 사고(경로 필터 일괄 삭제 + 즉시 저장)의 재발 방지 — 목록·확인·저장이 세 단계로 나뉜다.
+    """
+    if not names and not path_contains:
+        raise SwError("INTERNAL", "names 또는 path_contains 중 하나는 필요합니다 (전체 삭제는 지원하지 않음)")
+    app = api.get_app()
+    pm, pinfo = resolve(app, assembly)
+    if pinfo["type"] != "assembly":
+        raise SwError("DOC_NOT_FOUND", "assembly는 어셈블리여야 합니다")
+    cm = api.cast("IConfigurationManager", pm.ConfigurationManager)
+    root = api.cast("IComponent2", api.cast("IConfiguration", cm.ActiveConfiguration).GetRootComponent3(True))
+    comps = [api.cast("IComponent2", c) for c in (root.GetChildren() or [])]
+    children = [{"name": c.Name2, "path": c.GetPathName() or ""} for c in comps]
+    targets = select_delete_targets(children, names or [], path_contains)
+    precondition = {"assembly": pinfo["path"], "targets": sorted(t["name"] for t in targets),
+                    "top_level_count": len(children), "dirty": pinfo["dirty"]}
+    body = {"assembly": pinfo["title"], "assembly_path": pinfo["path"], "targets": targets,
+            "remaining_after": len(children) - len(targets),
+            "note": "메모리에서만 삭제됨. 저장은 sw_save(change_set_id) — Ctrl+Z로 되돌릴 수 있음"}
+    if dry_run:
+        plan = journal().create_plan("sw_delete_components", [t["name"] for t in targets], [body], [], precondition, 50)
+        return {"dry_run": True, "plan_id": plan["plan_id"], **body}
+    if not plan_id:
+        raise SwError("PLAN_STALE", "dry_run=false에는 plan_id가 필요합니다")
+    journal().check_plan(plan_id, "sw_delete_components", precondition)
+    if not targets:
+        raise SwError("DOC_NOT_FOUND", "삭제 대상이 없습니다")
+    api.activate(app, pm)
+    ext = api.cast("IModelDocExtension", pm.Extension)
+    base = os.path.splitext(pinfo["title"])[0]
+    deleted, failed = [], []
+    for t in targets:
+        pm.ClearSelection2(True)
+        ok = ext.SelectByID2(f"{t['name']}@{base}", "COMPONENT", 0, 0, 0, False, 0, None, 0)
+        if ok and ext.DeleteSelection2(0):
+            deleted.append(t["name"])
+        else:
+            failed.append(t["name"])
+    pm.ClearSelection2(True)
+    ext.Rebuild(SW_REBUILD_ALL)
+    # 보고는 말이 아니라 관측으로: 삭제 후 직계 컴포넌트를 다시 세어 대조한다
+    after = [api.cast("IComponent2", c).Name2 for c in (root.GetChildren() or [])]
+    still = [n for n in deleted if n in after]
+    cs = journal().mark_applied(plan_id, [pinfo["title"]], [], [pinfo["document_id"]])
+    return {"dry_run": False, "change_set_id": cs, "deleted": deleted, "failed": failed, "still_present": still,
+            "top_level_count_after": len(after), "dirty_documents": [pinfo["title"]],
+            "next": "sw_save(change_set_id) 로 저장. 저장 전이면 SolidWorks Ctrl+Z로 되돌릴 수 있음"}
 
 
 # ---------------------------------------------------------------- create_drawing
@@ -561,7 +693,6 @@ def create_drawing(sel: DocSelector, template: Optional[str], views: list[str], 
                 log.warning("AutoDimension 실패 %s: %s", v.Name, e)
     drw_m.ForceRebuild3(False)
     title = drw_m.GetTitle()
-    journal().mcp_owned.append(title)
     cs = journal().mark_applied(plan_id, [title], [])
     journal().attach_handles(cs, [drw_m])  # 미저장 도면은 제목이 겹칠 수 있어 객체로 보관
     return {"dry_run": False, "change_set_id": cs, "drawing_title": title, "views_created": created, "bom_inserted": bom_inserted,

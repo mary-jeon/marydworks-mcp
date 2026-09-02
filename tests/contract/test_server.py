@@ -1,15 +1,18 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 ROOT = Path(__file__).resolve().parents[2]
-PY = ROOT / ".venv" / "Scripts" / "python.exe"
+# 테스트를 돌리는 인터프리터로 서버를 띄운다 — 저장소에 .venv가 없어도(공개 체크아웃·CI) 동작
+PY = Path(sys.executable)
 LIMIT = 12000
 TOOLS = {"sw_status", "sw_summary", "sw_bom", "sw_audit", "sw_snapshot", "sw_set_properties",
-         "sw_save", "sw_export", "sw_rename_document", "sw_add_component", "sw_create_drawing", "sw_background"}
+         "sw_save", "sw_export", "sw_rename_document", "sw_add_component", "sw_create_drawing", "sw_background",
+         "sw_delete_components"}
 
 
 def params():

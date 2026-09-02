@@ -65,7 +65,10 @@ def sw_summary(doc: Optional[dict] = None) -> dict:
     description="어셈블리 부품 집계. structure: top_level(직계만)|parts_only(모든 파트 평면)|indented(계층). instances=실제 개수, qty_property=QT'Y 속성값, qty_mismatch로 불일치 표시. lightweight는 resolve_lightweight=true일 때만 해석.",
 )
 def sw_bom(doc: Optional[dict] = None, structure: str = "top_level", resolve_lightweight: bool = False, include_mass: bool = True) -> dict:
-    return envelope(_call(read.bom, _sel(doc), structure, resolve_lightweight, include_mass, timeout=300))
+    # resolve_lightweight=true는 경량 컴포넌트를 해석해 어셈블리를 수정 상태로 만든다 → 쓰기로 취급(재시도 없음, 효과 보고)
+    data = _call(read.bom, _sel(doc), structure, resolve_lightweight, include_mass, write=resolve_lightweight, timeout=300)
+    eff = {"changed_in_memory": True, "note": "resolve_lightweight로 경량 컴포넌트가 해석되어 어셈블리가 수정 상태가 될 수 있음"} if resolve_lightweight else {}
+    return envelope(data, effects=eff)
 
 
 @server.tool(
@@ -112,12 +115,23 @@ def sw_set_properties(props: dict, doc: Optional[dict] = None, docs: Optional[li
 
 @server.tool(
     name="sw_save",
-    description="저장. change_set_id(적용된 변경의 문서를 파트→어셈블리→도면 순서로) 또는 doc 하나. 저장된 적 없는 문서는 out_path 필요(기존 파일 덮어쓰지 않음). dry_run=true면 저장 목록만.",
+    description="저장. change_set_id(적용된 변경의 문서를 파트→어셈블리→도면 순서로) 또는 doc 하나. 저장된 적 없는 문서는 out_path 필요(기존 파일 덮어쓰지 않음). only_under=[폴더…]면 그 밖의 문서는 저장 거부(공용 라이브러리 보호). dry_run=true면 저장 목록만.",
 )
-def sw_save(change_set_id: Optional[str] = None, doc: Optional[dict] = None, out_path: Optional[str] = None, dry_run: bool = True) -> dict:
-    data = _call(write.save, change_set_id, DocSelector(**doc) if doc else None, out_path, dry_run, write=True, timeout=600)
+def sw_save(change_set_id: Optional[str] = None, doc: Optional[dict] = None, out_path: Optional[str] = None, dry_run: bool = True,
+            only_under: Optional[list[str]] = None) -> dict:
+    data = _call(write.save, change_set_id, DocSelector(**doc) if doc else None, out_path, dry_run, only_under, write=True, timeout=600)
     eff = {} if dry_run else {"files_created": [s["path"] for s in data["saved"] if out_path]}
     return envelope(data, effects=eff)
+
+
+@server.tool(
+    name="sw_delete_components",
+    description="어셈블리 직계 컴포넌트 삭제(메모리). names[] 정확 일치 또는 path_contains 경로 필터. dry_run=true(기본)가 삭제 대상 전수 목록과 plan_id를 반환하고, dry_run=false+plan_id로만 실행. 저장은 별도 sw_save.",
+)
+def sw_delete_components(assembly: dict, names: Optional[list[str]] = None, path_contains: Optional[str] = None,
+                         dry_run: bool = True, plan_id: Optional[str] = None) -> dict:
+    data = _call(write.delete_components, DocSelector(**assembly), names or [], path_contains, dry_run, plan_id, write=True, timeout=600)
+    return envelope(data, effects=_write_effects(dry_run, data))
 
 
 @server.tool(
@@ -126,7 +140,10 @@ def sw_save(change_set_id: Optional[str] = None, doc: Optional[dict] = None, out
 )
 def sw_export(out_path: str, format: str, doc: Optional[dict] = None, overwrite: bool = False) -> dict:
     data = _call(write.export, _sel(doc), format, out_path, overwrite, write=True, timeout=600)
-    return envelope(data, effects={"files_created": [data["path"]]})
+    eff = {"files_created": [data["path"]]}
+    if data.get("backup"):
+        eff["backup"] = data["backup"]
+    return envelope(data, effects=eff)
 
 
 @server.tool(

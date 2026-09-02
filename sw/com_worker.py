@@ -53,6 +53,8 @@ class _Job:
     done: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     exc: BaseException | None = None
+    started: bool = False    # STA 스레드가 실행을 시작했는가
+    cancelled: bool = False  # 호출자가 타임아웃으로 포기했는가 — 아직 시작 전이면 실행하지 않는다
 
 
 class ComWorker:
@@ -86,6 +88,12 @@ class ComWorker:
                 pythoncom.CoUninitialize()
 
     def _exec(self, job: _Job):
+        if job.cancelled:
+            # 호출자가 이미 BUSY로 포기한 작업. 특히 쓰기는 "실패"라고 보고된 뒤 몰래 적용되면 안 된다.
+            job.exc = SwError("BUSY", "타임아웃으로 취소된 작업 — 실행하지 않음")
+            job.done.set()
+            return
+        job.started = True
         try:
             if self._mutex and not self._mutex.acquire(self.mutex_timeout):
                 raise SwError("BUSY", "다른 marydworks-mcp 프로세스가 SolidWorks를 사용 중입니다 (30초 대기 초과)")
@@ -114,7 +122,14 @@ class ComWorker:
         job = _Job(fn, args, kw, write)
         self._q.put(job)
         if not job.done.wait(timeout):
-            raise SwError("BUSY", f"SolidWorks 호출이 {timeout:.0f}초 안에 끝나지 않았습니다")
+            job.cancelled = True
+            if job.started:
+                # 이미 COM 안에서 도는 중이라 중단할 수 없다. 나중에 끝날 수 있음을 숨기지 않는다.
+                what = "쓰기 작업" if job.write else "호출"
+                raise SwError("BUSY", f"SolidWorks {what}이 {timeout:.0f}초 안에 끝나지 않았습니다. "
+                                      "작업은 이미 시작되어 SolidWorks가 응답하면 그대로 완료될 수 있습니다 — "
+                                      "재시도 전에 sw_status로 실제 상태를 확인하세요")
+            raise SwError("BUSY", f"SolidWorks가 {timeout:.0f}초 안에 응답하지 않아 대기열의 작업을 취소했습니다 (실행되지 않음)")
         if job.exc:
             raise job.exc
         return job.result
