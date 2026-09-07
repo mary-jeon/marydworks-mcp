@@ -101,13 +101,20 @@ class Journal:
             self._write("change_sets", self._cs[cs_id])
 
     def backup(self, paths: list[str], related: list[str], reason: str) -> dict:
-        d = self.root.parent / "_backup" / time.strftime("%Y%m%d-%H%M%S")
+        # 같은 초의 두 호출·같은 파일명의 두 원본이 서로 덮어쓰지 않게 폴더는 고유 접미사, 파일은 충돌 시 경로 해시 접미사(2026-09-07 검토)
+        d = self.root.parent / "_backup" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
         d.mkdir(parents=True, exist_ok=True)
         files = []
+        used: set[str] = set()
         for p in paths:
             if not os.path.isfile(p):
                 continue
-            dst = d / os.path.basename(p)
+            name = os.path.basename(p)
+            if name.lower() in used:
+                stem, ext = os.path.splitext(name)
+                name = f"{stem}__{hashlib.sha1(os.path.abspath(p).lower().encode()).hexdigest()[:8]}{ext}"
+            used.add(name.lower())
+            dst = d / name
             shutil.copy2(p, dst)
             h = hashlib.sha256(open(p, "rb").read()).hexdigest()
             files.append({"source": p, "backup": str(dst), "sha256": h, "bytes": os.path.getsize(p)})

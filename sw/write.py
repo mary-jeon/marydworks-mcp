@@ -22,6 +22,7 @@ SW_ADD_REPLACE = 2
 SW_SAVE_SILENT = 1
 SW_SAVE_REFERENCED = 2
 SW_REBUILD_ALL = 1
+SW_ADD_MATE_NO_ERROR = 1  # swAddMateError_e: 0=ErrorUknown, 1=NoError (swconst.tlb, SOLIDWORKS 2024) — 0을 성공으로 보면 안 된다
 
 # ---------------------------------------------------------------- set_properties
 
@@ -89,7 +90,7 @@ def set_properties(docs: list[DocSelector], scope: str, props: dict, assembly: O
         changes, warnings = plan_property_changes(current, resolved_props)
         all_warnings += [f"{info['title']}: {w}" for w in warnings]
         per_doc.append({"document": info["title"], "path": info["path"], "configuration": cfg, "changes": changes})
-        precondition[info["document_id"] + "|" + cfg] = {c["name"]: c["before"] for c in changes}
+        precondition[info["document_id"] + "|" + cfg] = {c["name"]: [c["before"], c["after"]] for c in changes}  # after까지 묶어 plan_id 재사용 차단
     if dry_run:
         plan = journal().create_plan("sw_set_properties", [d["document"] for d in per_doc], per_doc, [], precondition, 200)
         return {"dry_run": True, "plan_id": plan["plan_id"], "expires_in_s": 600, "documents": per_doc, "warnings": all_warnings}
@@ -230,7 +231,7 @@ def pick_change_set_docs(cs: dict, wanted: list[dict], open_docs: list[dict]) ->
     return out
 
 
-def check_save_scope(docs: list[dict], only_under: list[str]) -> list[str]:
+def check_save_scope(docs: list[dict], only_under: list[str], out_path: str | None = None) -> list[str]:
     """only_under 밖의 문서 경로를 돌려준다 (순수 함수). 공용 라이브러리·타 프로젝트 문서가
     저장 루프에 딸려 들어가는 사고를 막는 화이트리스트."""
     if not only_under:
@@ -243,6 +244,8 @@ def check_save_scope(docs: list[dict], only_under: list[str]) -> list[str]:
             continue  # 미저장 문서는 out_path로 별도 판정
         if not any(normalize_path(p).startswith(r) for r in roots):
             outside.append(p)
+    if out_path and not any(normalize_path(out_path).startswith(r) for r in roots):
+        outside.append(out_path)  # 미저장 문서의 새 경로도 같은 화이트리스트로 판정
     return outside
 
 
@@ -284,7 +287,7 @@ def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Opt
                                      + ", ".join(unsaved) + " — 문서별로 sw_save(doc=..., out_path=...)")
     if out_path and os.path.exists(out_path):
         raise SwError("FILE_EXISTS", f"이미 존재: {out_path}")
-    outside = check_save_scope(ordered, only_under or [])
+    outside = check_save_scope(ordered, only_under or [], out_path)
     if outside:
         raise SwError("FILE_EXISTS", f"only_under 밖의 문서 {len(outside)}개는 저장하지 않습니다 (공용 라이브러리·타 프로젝트 보호)",
                       {"outside": outside, "only_under": only_under})
@@ -403,7 +406,9 @@ def rename_document(target: DocSelector, parent: DocSelector, new_name: str, upd
     comp = comps[0]
     open_refs = find_referencing_docs(_deps_of_open_docs(app), tinfo["path"])
     precondition = {"target": tinfo["path"], "parent": pinfo["path"], "component": comp.Name2, "new_exists": exists,
-                    "parent_dirty": pinfo["dirty"]}
+                    "parent_dirty": pinfo["dirty"],
+                    "request": {"new_name": new_name, "update_unopened_references": bool(update_unopened_references),
+                                "search_folders": list(search_folders or []), "sync_properties": sync_properties or {}}}
     plan_body = {"target": tinfo, "parent": pinfo["title"], "component": comp.Name2, "new_name": new_name, "new_path": new_path,
                  "existing_file_will_move": exists, "open_referencing_docs": open_refs,
                  "update_unopened_references": update_unopened_references, "search_folders": search_folders or [folder],
@@ -453,6 +458,18 @@ def rename_document(target: DocSelector, parent: DocSelector, new_name: str, upd
 
 MATE_TYPES = {"coincident": 0, "concentric": 1, "distance": 5}
 SW_MATE_ALIGN_CLOSEST = 2
+
+
+def mate_succeeded(mate, err: int) -> bool:
+    """AddMate5 판정(순수 함수). swAddMateError_e는 NoError=1, ErrorUknown=0 — 예전 코드는 err!=0을 실패로 봐서
+    정상 메이트를 롤백했다(2026-09-07 검토). 0은 일부 버전이 정상 메이트에도 돌려주므로 mate 객체가 있으면 성공."""
+    return mate is not None and err in (0, SW_ADD_MATE_NO_ERROR)
+
+
+def add_component_precondition(assembly_path: str, top_level_count: int, part_path: str, position_mm, specs, rollback) -> dict:
+    """plan_id가 요청 내용(위치·메이트·rollback)까지 묶이도록 precondition에 넣는다 — 같은 plan_id로 다른 위치 실행 차단."""
+    return {"assembly": assembly_path, "top_level_count": top_level_count, "part": normalize_path(part_path),
+            "position_mm": [float(v) for v in position_mm], "mates": specs, "rollback": rollback}
 ENTITY_TYPES = ("FACE", "EDGE", "PLANE", "AXIS", "VERTEX")
 
 
@@ -495,7 +512,7 @@ def add_component(assembly: DocSelector, part_path: str, position_mm: list[float
         raise SwError("DOC_NOT_FOUND", "assembly는 어셈블리여야 합니다")
     a = api.cast("IAssemblyDoc", pm)
     before_count = int(a.GetComponentCount(True))
-    precondition = {"assembly": pinfo["path"], "top_level_count": before_count, "part": normalize_path(part_path)}
+    precondition = add_component_precondition(pinfo["path"], before_count, part_path, position_mm, specs, rollback)
     body = {"assembly": pinfo["title"], "part_path": part_path, "position_mm": position_mm, "mates": specs,
             "rollback": rollback, "top_level_count_before": before_count}
     if dry_run:
@@ -518,8 +535,10 @@ def add_component(assembly: DocSelector, part_path: str, position_mm: list[float
             break
         # AddMate5(..., ErrorStatus[out]) -> (mate, errorStatus)
         r = a.AddMate5(s["code"], SW_MATE_ALIGN_CLOSEST, False, s["distance_m"], 0, 0, 0, 0, 0, 0, 0, False, False, 0)
-        mate, err = (r[0], int(r[1])) if isinstance(r, tuple) else (r, 0)
-        if mate is None or err != 0:
+        mate, err = (r[0], int(r[1])) if isinstance(r, tuple) else (r, SW_ADD_MATE_NO_ERROR)
+        if err == 0 and mate is not None:
+            log.warning("AddMate5 ErrorStatus=0(ErrorUknown)이지만 mate 객체가 있어 성공으로 처리")
+        if not mate_succeeded(mate, err):
             failed = f"mates[{i}] AddMate5 실패 (swAddMateError_e={err})"
             break
         added.append(s["type"])
@@ -643,7 +662,7 @@ def create_drawing(sel: DocSelector, template: Optional[str], views: list[str], 
     app = api.get_app()
     m, info = resolve(app, sel)
     plan_body = drawing_plan(info, template or DEFAULT_TEMPLATE, views, bom, auto_dimension)
-    precondition = {"model": info["path"], "dirty": info["dirty"]}
+    precondition = {"model": info["path"], "dirty": info["dirty"], "request": plan_body}
     if dry_run:
         plan = journal().create_plan("sw_create_drawing", [info["title"]], [plan_body], [], precondition, 1)
         return {"dry_run": True, "plan_id": plan["plan_id"], **plan_body,
