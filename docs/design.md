@@ -1,5 +1,7 @@
 # marydworks-mcp 설계 문서
 
+> **이력 문서 — 2024 기반 초기 설계.** 아래 목적·동작·보호 설명은 당시 설계 기록이다. 현재 제품 목표와 구현 상태는 [프로젝트 목표](../../docs/PROJECT.md), [설계 구조](../../docs/ARCHITECTURE.md), [검증 상태](../../docs/CAPABILITY-STATUS.md), [개발 순서](../../docs/ROADMAP.md)를 기준으로 한다. 현재 코드는 범용 플랫폼 전체가 아니며 계획 내용·저장 범위·백업·메이트의 미해결 사항이 있다. 2026 호환성은 추가 실기 검증 대상이다.
+
 대상 SolidWorks 2024 SP5 (rev 32.5.0) · Windows 11 · Python 3.12
 
 ## 1. 목적

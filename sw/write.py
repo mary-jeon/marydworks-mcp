@@ -11,6 +11,7 @@ import os
 from typing import Optional
 
 from . import api
+from .com_worker import progress
 from .journal import journal, save_order
 from .models import DocSelector, SwError
 from .read import bom, custom_properties
@@ -120,6 +121,7 @@ def set_properties(docs: list[DocSelector], scope: str, props: dict, assembly: O
                 raise SwError("COM_ERROR", f"{info['title']} {c['name']} 설정 실패 rc={rc}")
         dirty.append(info["title"])
         dirty_ids.append(info["document_id"])
+        progress(applied_documents=[info["title"]])  # 중간에 실패·timeout 나도 어디까지 바뀌었는지 남긴다
     cs = journal().mark_applied(plan_id, dirty, [], dirty_ids)
     return {"dry_run": False, "change_set_id": cs, "applied": per_doc, "dirty_documents": dirty, "warnings": all_warnings}
 
@@ -297,6 +299,7 @@ def save(change_set_id: Optional[str], doc: Optional[DocSelector], out_path: Opt
     for d in ordered:
         m = api.find_doc(app, d)
         saved.append(save_model(app, m, out_path if not d["path"] else None, rename))
+        progress(saved=[d["title"]])
     if change_set_id:
         journal().mark_saved(change_set_id, [s["title"] for s in saved])
     return {"dry_run": False, "saved": saved}
@@ -422,6 +425,7 @@ def rename_document(target: DocSelector, parent: DocSelector, new_name: str, upd
     journal().check_plan(plan_id, "sw_rename_document", precondition)
     man = journal().backup([tinfo["path"], pinfo["path"]] + ([new_path] if exists else []),
                            related=open_refs, reason=f"rename {tinfo['title']} -> {new_name}")
+    progress(backup_dir=man["dir"])
     if exists:
         import shutil
 
@@ -435,6 +439,7 @@ def rename_document(target: DocSelector, parent: DocSelector, new_name: str, upd
     rc = int(ext.RenameDocument(new_name))
     if rc != 0:
         raise SwError("COM_ERROR", f"RenameDocument 실패 (swRenameDocumentError_e={rc})")
+    progress(renamed={"component": comp.Name2, "new_name": new_name})
     ext.Rebuild(SW_REBUILD_ALL)
     synced = {}
     if sync_properties:
@@ -526,6 +531,7 @@ def add_component(assembly: DocSelector, part_path: str, position_mm: list[float
     comp = api.cast("IComponent2", a.AddComponent5(part_path, 0, "", False, "", x, y, z))
     if comp is None:
         raise SwError("COM_ERROR", "AddComponent5가 컴포넌트를 돌려주지 않았습니다 (경로/구성 확인)")
+    progress(component_added=comp.Name2)
     ext = api.cast("IModelDocExtension", pm.Extension)
     added, failed = [], None
     for i, s in enumerate(specs):
@@ -542,10 +548,12 @@ def add_component(assembly: DocSelector, part_path: str, position_mm: list[float
             failed = f"mates[{i}] AddMate5 실패 (swAddMateError_e={err})"
             break
         added.append(s["type"])
+        progress(mates_added=[s["type"]])
     pm.ClearSelection2(True)
     if failed and rollback == "delete_component":
         comp.Select4(False, None, False)
         pm.EditDelete()
+        progress(rolled_back=True)
         raise SwError("COM_ERROR", f"{failed} — 컴포넌트 삭제(rollback)")
     ext.Rebuild(SW_REBUILD_ALL)
     cs = journal().mark_applied(plan_id, [pinfo["title"]], [], [pinfo["document_id"]])
@@ -612,6 +620,7 @@ def delete_components(assembly: DocSelector, names: list[str], path_contains: Op
         ok = ext.SelectByID2(f"{t['name']}@{base}", "COMPONENT", 0, 0, 0, False, 0, None, 0)
         if ok and ext.DeleteSelection2(0):
             deleted.append(t["name"])
+            progress(deleted=[t["name"]])
         else:
             failed.append(t["name"])
     pm.ClearSelection2(True)
@@ -675,6 +684,7 @@ def create_drawing(sel: DocSelector, template: Optional[str], views: list[str], 
         raise SwError("COM_ERROR", "NewDocument 실패 (템플릿 확인)")
     drw_m = api.cast("IModelDoc2", drw_raw)
     drw = api.cast("IDrawingDoc", drw_raw)
+    progress(drawing_document_created=True)
     created = []
     if any(v in ("front", "top", "right") for v in views):
         if not drw.Create3rdAngleViews2(plan_body["model_path"]):

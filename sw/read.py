@@ -46,13 +46,24 @@ def _referenced_paths(app, docs: list[dict]) -> set[str]:
     return refs
 
 
+def _operations() -> dict:
+    """최근 operation과 timeout 후에도 실행 중인 쓰기(FIX-06). unresolved_writes가 비기 전엔 새 쓰기가 BUSY로 거부된다."""
+    from .com_worker import WORKER
+
+    if WORKER is None:
+        return {"unresolved_writes": [], "recent": []}
+    return {"unresolved_writes": WORKER.unresolved_writes(),
+            "recent": [r for r in WORKER.recent(20) if r["name"] != "status"]}
+
+
 def status() -> dict:
     try:
         app = api.get_app()
     except SwError as e:
         if e.code == "SW_NOT_RUNNING":
             return {"connected": False, "version": None, "active": None, "documents": [], "open_count": 0,
-                    "dirty_count": 0, "dirty_documents": [], "top_level_assemblies": [], "simulation": None}
+                    "dirty_count": 0, "dirty_documents": [], "top_level_assemblies": [], "simulation": None,
+                    "operations": _operations()}
         raise
     docs = api.list_docs(app, with_raw=True)
     referenced = _referenced_paths(app, docs)
@@ -73,6 +84,7 @@ def status() -> dict:
         "dirty_documents": [d["title"] for d in docs if d["dirty"]],
         "top_level_assemblies": top_asms,
         "simulation": _simulation_state(app),
+        "operations": _operations(),
     }
 
 

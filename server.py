@@ -29,13 +29,16 @@ def _call(fn, *args, write: bool = False, timeout: float = 120.0, **kw) -> Any:
         return worker().run(fn, *args, write=write, timeout=timeout, **kw)
     except SwError as e:
         msg = f"{e.code}: {e.message}"
-        if e.details:
-            msg += "\n" + json.dumps(e.details, ensure_ascii=False)
+        details = dict(e.details)
+        if getattr(e, "op_id", None):
+            details.setdefault("op_id", e.op_id)  # sw_status.operations에서 같은 id로 찾을 수 있다
+        if details:
+            msg += "\n" + json.dumps(details, ensure_ascii=False)
         raise ToolError(msg) from e
     except ToolError:
         raise
     except Exception as e:  # noqa: BLE001
-        op = uuid.uuid4().hex[:12]
+        op = getattr(e, "op_id", None) or uuid.uuid4().hex[:12]
         log.exception("INTERNAL operation_id=%s", op)
         raise ToolError(f"INTERNAL: 내부 오류 (operation_id={op}, {type(e).__name__}: {e})") from e
 
@@ -46,7 +49,7 @@ def _sel(doc: Optional[dict]) -> DocSelector:
 
 @server.tool(
     name="sw_status",
-    description="SolidWorks 연결 상태·버전·열린 문서 목록(수정됨/읽기전용/활성)·최상위 어셈블리·Simulation 상태. SolidWorks를 실행하지는 않음.",
+    description="SolidWorks 연결 상태·버전·열린 문서 목록(수정됨/읽기전용/활성)·최상위 어셈블리·Simulation 상태·최근 operation(timeout 후 실행 중인 쓰기 포함). SolidWorks를 실행하지는 않음.",
 )
 def sw_status() -> dict:
     return envelope(_call(read.status))

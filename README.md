@@ -1,216 +1,94 @@
-# marydworks-mcp — SolidWorks MCP Server for Claude (Model Context Protocol)
+# marydworks-mcp — SOLIDWORKS MCP 실행기
 
-**marydworks-mcp is an open-source MCP server that connects Claude Code, Cursor, Windsurf or any Model Context Protocol client to a running SolidWorks 2024 session.** It exposes 13 tools for reading parts, assemblies and BOMs, and for editing custom properties, renaming files, deleting components, exporting STEP/PDF and generating drawings — every write goes through a dry-run → apply → save workflow, so nothing changes on disk without an explicit step.
+A Python stdio MCP server for a running SOLIDWORKS 2024 session. This repository is a distribution variant within the local general-purpose design automation project. SOLIDWORKS 2026 compatibility is a validation target, not a verified claim.
 
-Keywords: SolidWorks MCP server · SolidWorks API automation · Claude SolidWorks · Model Context Protocol CAD · pywin32 SolidWorks · SolidWorks BOM extraction · SolidWorks custom properties automation · AI CAD assistant
+## 현재 프로젝트 방향
 
-> 한국어 소개는 문서 하단 [한국어](#한국어) 섹션에 있습니다.
+[프로젝트 목표](../docs/PROJECT.md) · [설계 구조](../docs/ARCHITECTURE.md) · [검증 상태](../docs/CAPABILITY-STATUS.md) · [개발 순서](../docs/ROADMAP.md) · [SOLIDWORKS 제안](../docs/SOLIDWORKS-PROPOSAL.md)
 
-## TL;DR
+최종 목표는 새 모델 생성과 기존 설계 변경을 요구사항별 검증·도면·BOM으로 연결하는 범용 플랫폼이다. 현재 이 저장소는 13개 도구를 제공하는 실행기이며, 범용 설계 플랫폼 전체가 구현된 상태는 아니다.
 
-- **What it is:** a Python MCP server (`mcp>=2`) that attaches to the SolidWorks COM API via pywin32.
-- **What it does:** read status / summary / BOM / audit / snapshot; write properties, save, export, rename, insert components, create drawings; optional headless instance.
-- **How it stays safe:** read-first tools, `dry_run=true` by default, precondition hashes (`PLAN_STALE`), backups before renames and overwrites, a save scope whitelist (`only_under`), deletions only from a listed plan, no document open/close.
-- **Footprint:** 13 tools, about 8,000 characters of tool schema per session, one background COM thread.
-- **Requirements:** Windows, SolidWorks 2024 (SP5 tested), Python 3.12, `pywin32`, `mcp>=2,<3`.
+sw-mcp와 별도 소스다. 한 저장소의 수정이나 테스트 결과가 자동 적용되지 않는다. 외부 기반 solidworks-automation-skill의 지원 수준도 이 실행기의 검증 결과와 구분한다. 위 링크는 세 저장소가 있는 로컬 workspace 기준이며 단독 배포 시 기준 문서를 함께 포함해야 한다.
 
-## Table of contents
+## 도구
 
-1. [Why another SolidWorks MCP server?](#why-another-solidworks-mcp-server)
-2. [Tools](#tools)
-3. [Use cases](#use-cases)
-4. [Install and register with Claude Code](#install-and-register-with-claude-code)
-5. [How the write workflow works](#how-the-write-workflow-works)
-6. [Safety notes](#safety-notes)
-7. [FAQ](#faq)
-8. [Implementation notes](#implementation-notes)
-9. [Tests](#tests)
-10. [Repository layout](#repository-layout)
-11. [한국어](#한국어)
-
-## Why another SolidWorks MCP server?
-
-Existing SolidWorks MCP projects tend to expose 30–40 tools and push 50,000+ characters of JSON schema into every LLM session. marydworks-mcp keeps the surface small and puts guard rails around anything that can change a file:
-
-| | marydworks-mcp | Typical SolidWorks MCP |
-|---|---|---|
-| Tools | 13 | 30–40 |
-| Tool schema per session | ~7 k chars | ~50 k chars |
-| Write model | dry-run → plan_id → apply → save | direct calls |
-| Backups before rename/export-overwrite | yes, with manifest | rarely |
-| Deletes components without a listed plan | never | often |
-| Opens/closes user documents | never | often |
-| Switches active document on save/export | no | usually |
-| COM threading | one STA worker thread + named mutex | varies |
-
-## Tools
-
-| Tool | What it does |
+| 도구 | 현재 역할 |
 |---|---|
-| `sw_status` | Connection, SolidWorks version, open documents (dirty / read-only / active), top-level assemblies |
-| `sw_summary` | Part or assembly summary: custom properties (file + configuration), material, bodies, mass, bounding box (approximate), feature count |
-| `sw_bom` | Assembly roll-up (`top_level` / `parts_only` / `indented`) with real instance counts vs. the `QT'Y` property, material, SPEC, mass |
-| `sw_audit` | Missing properties, quantity mismatches, "copy"-named files, unassigned material, lightweight/suppressed components, optional interference check |
-| `sw_snapshot` | Isometric/front/top/right BMP captures; restores the view and the active document afterwards |
-| `sw_set_properties` | Custom-property edits with `$today`, `$instances`, `$expr:` helpers; preserves existing property types (dates stay dates) |
-| `sw_save` | Saves a change set in dependency order (parts → assemblies → drawings) or a single document; unsaved documents need `out_path`; `only_under=[folders]` refuses to save anything outside them (shared libraries, other projects) |
-| `sw_export` | STEP / STL / PNG for models, PDF / DXF for drawings; never overwrites unless asked, and then only after copying the original to `_backup/`; verifies size and hash |
-| `sw_rename_document` | In-assembly `RenameDocument` with backup, reference update through `RenamedDocumentNotify`, optional property sync |
-| `sw_add_component` | Insert a part at `position_mm` with simple mates (coincident / concentric / distance), rollback on failure |
-| `sw_delete_components` | Delete top-level components of an assembly, chosen by `names[]` or `path_contains`; the dry run returns the **full target list** and a `plan_id`, apply needs that plan, and saving is a separate `sw_save` |
-| `sw_create_drawing` | Third-angle views + isometric + BOM table from a drawing template; save with `sw_save`, PDF with `sw_export` |
-| `sw_background` | Optional headless SolidWorks instance for batch jobs; refuses to start while any SolidWorks process is running |
+| sw_status | 연결·버전·열린 문서·수정 상태 |
+| sw_summary | 속성·재질·질량·근사 외형 |
+| sw_bom | 조립 물량 집계·수량 속성 대조 |
+| sw_audit | 속성·수량·재질·참조 관련 검사, 선택적 간섭 |
+| sw_snapshot | 뷰 이미지 생성 |
+| sw_set_properties | 계획 기반 사용자 속성 변경 |
+| sw_save | 변경 문서 또는 지정 문서 저장 |
+| sw_export | STEP/STL/PNG/PDF/DXF 출력 |
+| sw_rename_document | 이름 변경과 참조 갱신 |
+| sw_add_component | 부품 삽입과 단순 메이트 |
+| sw_delete_components | 열거한 직계 컴포넌트 삭제 |
+| sw_create_drawing | 기본 뷰·선택적 BOM/치수의 도면 생성 |
+| sw_background | 사용자 SOLIDWORKS 프로세스가 없을 때 명시적 비가시 인스턴스 관리 |
 
-Every tool takes a document selector: `{"active": true}` (default), `{"path": "..."}`, or `{"title": "..."}` (only when the title is unique), plus an optional `configuration`.
+문서 선택자는 `{"active": true}`, `{"path": "..."}`, 유일한 `{"title": "..."}`와 선택적 configuration이다. 일반 스케치·돌출·컷 생성 도구는 현재 목록에 없다.
 
-## Use cases
+## 설치와 연결
 
-- **BOM and spec extraction:** "List every part in this assembly with material, SPEC and real quantity" → `sw_bom` in one call, quantity mismatches flagged.
-- **Property clean-up:** "Set DATE to today and QT'Y to the real count on all parts" → `sw_set_properties` dry-run shows the diff, apply, `sw_save`.
-- **Renumbering parts:** "Part 4 was deleted, shift 5–11 down" → `sw_rename_document` per part with backups and reference updates.
-- **Design review by an LLM:** `sw_snapshot` + `sw_summary` give the model images and numbers to reason about structure, loads or code compliance.
-- **Batch export:** STEP for suppliers, PDF drawings for review — `sw_export` verifies every file it writes.
-
-## Install and register with Claude Code
+Windows, SOLIDWORKS 2024, Python 3.12, pywin32와 프로젝트 requirements가 필요하다.
 
 ```powershell
-git clone https://github.com/mary-jeon/marydworks-mcp
-cd marydworks-mcp
+cd C:\path\to\marydworks-mcp
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt   # exact versions: requirements.lock
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-Add the server to `~/.claude.json` under `mcpServers` (any MCP client uses the same command/args):
+지원하는 MCP 클라이언트의 stdio 서버 설정에 다음을 등록한다.
 
 ```json
-"solidworks": {
+{
   "command": "C:\\path\\to\\marydworks-mcp\\.venv\\Scripts\\python.exe",
   "args": ["C:\\path\\to\\marydworks-mcp\\server.py"],
   "env": {"PYTHONUTF8": "1"}
 }
 ```
 
-Start SolidWorks, open a new Claude Code session and ask "is SolidWorks connected?" — `sw_status` should return `connected: true`.
+SOLIDWORKS가 실행 중인 환경에서 sw_status 결과를 확인한다. Python 프로세스가 실행 중인 것만으로 정상 연결이 확인된 것은 아니다.
 
-## How the write workflow works
+## 계획 기반 편집 절차와 한계
 
-1. Call a write tool with `dry_run=true` (the default). You get a `plan_id`, the before/after values and the files that would change. Plans expire after 10 minutes.
-2. Call the same tool with `dry_run=false, plan_id=...`. The server re-reads the current values; if they differ from the plan it returns `PLAN_STALE` instead of writing. On success it changes the model **in memory only** and returns a `change_set_id`.
-3. Call `sw_save(change_set_id)`. Documents are saved in dependency order. Until this step, Ctrl+Z in SolidWorks undoes everything.
+1. 속성·이름·삽입·삭제·도면 생성의 dry_run으로 대상과 변경 내용을 확인한다.
+2. 허용된 범위에서 plan_id로 적용한다. 사전조건이 바뀌면 새 계획이 필요하다.
+3. 검증 후 sw_save로 저장한다. 현재 sw_save도 dry_run이 기본값이므로 실제 저장 호출은 인자를 명시한다.
+4. 저장과 재열기 결과 및 도면/BOM을 확인한다.
 
-Renames and export overwrites additionally copy the original files into `_backup/<timestamp>/` with a `manifest.json` (paths, SHA-256, related documents). Set `SW_MCP_JOURNAL_DIR` to keep `journal/` and `_backup/` outside the checkout.
+sw_export는 plan_id 없이 파일을 출력한다. 도구마다 파일 부작용이 다르므로 “모든 쓰기가 dry-run을 거친다” 또는 “sw_save 이전에는 디스크 변경이 없다”라고 해석하지 않는다.
 
-## Safety notes
+## 미해결 문제와 운영 제약
 
-- **Modal dialogs freeze COM.** If SolidWorks shows any dialog, every call blocks; the server returns `BUSY` after a bounded wait. A queued job that timed out is cancelled and never runs later; a job that had already started may still complete when SolidWorks responds. The error says which, so check `sw_status` before retrying a write.
-- **Deleting is a three-step action.** `sw_delete_components` lists every target in the dry run, deletes only from that plan, and never saves. Do not delete from ad-hoc COM scripts and save in the same breath. That is exactly how a path filter once removed functional parts from twelve assemblies.
-- **Run one SolidWorks instance.** A second (even empty) instance makes every COM call dramatically slower and can hijack the Running Object Table connection.
-- **Never `DispatchEx` into a running session.** `DispatchEx("SldWorks.Application")` returns the *existing* instance when one is running; calling `Visible=False`, `CloseAllDocuments` or `ExitApp` on it terminates the user's session. `sw_background` therefore refuses to start unless no SolidWorks process exists and verifies the new PID before touching anything.
-- **Date properties are typed.** Writing free text into a Date property leaves a ghost value that blocks re-adding the property; the server deletes and re-adds with the original type instead.
+2026-09-07 코드 검토에서 sw-mcp와 공통인 계획 payload 검증 공백, 신규 출력 경로 검사 공백, 백업 이름 충돌, 메이트 성공 코드 판정 문제를 확인해 같은 날 두 저장소에 수정했고(05ef7b1), timeout 이후 operation 상태 관리는 2026-09-08에 추가했다. 이 저장소에서 unit 66·contract 4가 통과했으나 실제 SolidWorks 실기 검증 결과는 아니다. [상태와 근거](../docs/CAPABILITY-STATUS.md)
 
-## FAQ
+- only_under는 선택 옵션이다(지정하면 미저장 문서의 새 out_path도 같은 범위로 검사). 강제 프로젝트 정책은 개발 대상이다.
+- 백업 폴더·파일명 충돌은 09-07에 고쳤다. 삭제·일괄 피처 수정 전체의 복구를 보장하지 않는다.
+- plan_id는 after 값·위치·메이트·요청 내용까지 묶인다(09-07). 그래도 plan_id 발급이 사람의 승인을 뜻하지는 않는다.
+- Ctrl+Z로 모든 변경을 한 번에 되돌릴 수 있다고 가정하지 않는다.
+- 대기열에서 아직 시작하지 않은 작업은 timeout 시 취소되고, 이미 실행 중인 COM 작업은 timeout_running으로 기록된다. 그 쓰기의 결과가 확정될 때까지 새 쓰기는 거부된다(sw_status.operations, journal/operations.jsonl).
+- 모달 대화상자·다중 인스턴스는 연결을 방해할 수 있다. 소유 세션과 미저장 문서를 확인한 뒤 처리한다.
+- 근사 bbox·이미지와 API 성공 반환만으로 정밀 치수·하중·제조 적합성을 판정하지 않는다.
 
-**Does it work with SolidWorks 2023 or 2025?**
-It is written against the SolidWorks 2024 type library (`sldworks.tlb`, major version 32). Other versions need the type-library version constant in `sw/api.py` changed; the COM calls themselves are long-standing API members.
+## 2026 지원 계획
 
-**Does it launch SolidWorks?**
-No. It attaches to the running session through the Running Object Table. The only exception is `sw_background`, which starts a headless instance and only when no SolidWorks process exists.
+현재 타입 라이브러리는 major 32 기준이다. 버전 감지·COM 반환 형태·enum·템플릿·단위·저장/재열기를 2026에서 검증해야 한다. 상수 변경만으로 지원 완료로 표시하지 않는다. LEO/AURA 외부 호출은 공식 확장 방법 확인 후 검토한다.
 
-**Will it change my model without asking?**
-No. Every write tool defaults to `dry_run=true`, and nothing reaches disk until you call `sw_save`.
-
-**Why not comtypes?**
-Its generated module fails to import under a Korean (CP949) locale. pywin32 early binding through makepy works reliably.
-
-**How fast is it with hundreds of open documents?**
-Enumerating 348 open documents takes about 0.5–2 s. The trick is `GetDocuments()` plus dynamic attribute access (~0.3 ms per call) instead of casting every document to `IModelDoc2` (~27 ms each).
-
-**Can I use it from Cursor, Windsurf or another MCP client?**
-Yes — it is a standard stdio MCP server. Use the same `command` / `args` / `env` in that client's MCP configuration.
-
-## Implementation notes
-
-- Early binding via `sldworks.tlb` (makepy) for typed calls; `[out] long` arguments (`Save3`, `SaveAs3`, `ActivateDoc3`) go through a dynamic dispatch with by-ref `VARIANT`s.
-- All COM work runs on a single STA thread with a Windows named mutex, because `mcp>=2` executes synchronous tools on worker threads.
-- Standard view names are localized (for example `*등각 보기` in Korean); the drawing tool reads `GetModelViewNames()` instead of hard-coding `*Isometric`.
-- Assembly saves after `RenameDocument` require `swSaveAsOptions_SaveReferenced` without the silent flag and a `RenamedDocumentNotify` event sink built with `win32com.client.getevents`.
-
-## Tests
+## 테스트
 
 ```powershell
-.venv\Scripts\python -m pytest tests/unit tests/contract -q     # no SolidWorks needed
-.venv\Scripts\python -m pytest tests/live -q -m live             # needs SolidWorks + tests/live/config.json
+.venv\Scripts\python -m pytest tests/unit -q
+.venv\Scripts\python -m pytest tests/contract -q
+.venv\Scripts\python -m pytest tests/live -q -m live
 ```
 
-Live tests read every expected value from `tests/live/config.json` (copy `config.example.json`). Rename and insert tests run only against a Pack-and-Go copy you point them to.
+unit은 CAD에 연결하지 않는 로직 검사다. contract는 서버를 실행하고 연결 경로를 읽을 수 있다. live는 실제 CAD와 tests/live/config.json을 사용하므로 테스트 파일을 검토하고 Pack and Go 복사본에서 수행한다. 이번 문서 정리에서는 테스트를 새로 실행하지 않았다.
 
-## Repository layout
+## 소스와 이력
 
-```
-server.py          MCPServer + tool registration
-sw/com_worker.py   single STA COM thread, named mutex, busy retry
-sw/api.py          type-library casting, by-ref helpers, document enumeration
-sw/selectors.py    document selector
-sw/models.py       result envelope, error codes
-sw/read.py         read tools
-sw/write.py        write tools
-sw/journal.py      plan / change set / backup manifest
-sw/background.py   headless instance (guarded)
-docs/design.md     design document (Korean)
-```
+실제 도구 등록은 server.py, 실행은 sw/, 테스트는 tests/에 있다. [초기 설계 기록](docs/design.md)은 현재 목표와 구분해 보존한다. 기존 README 원문은 [문서 보존본](../docs/archive/2026-09-07/marydworks-mcp/README.md)에 있다.
 
-License: MIT.
-
----
-
-## 한국어
-
-### marydworks-mcp — Claude용 SolidWorks MCP 서버
-
-marydworks-mcp는 실행 중인 SolidWorks 2024 세션에 Claude Code·Cursor·Windsurf 같은 MCP(Model Context Protocol) 클라이언트를 연결하는 오픈소스 MCP 서버입니다. 파트·어셈블리·BOM을 읽는 도구와 사용자 속성 수정, 파일 이름 변경, 컴포넌트 삭제, STEP/PDF 내보내기, 도면 생성 도구 13개를 제공합니다. 쓰기 작업은 전부 dry-run → 적용 → 저장 순서를 거치므로 명시적인 단계 없이는 디스크의 파일이 바뀌지 않습니다.
-
-### 한눈에 보기
-
-- **정체:** SolidWorks COM API에 pywin32로 붙는 Python MCP 서버(`mcp>=2`)
-- **기능:** 상태·요약·BOM·점검·스냅샷 읽기, 속성 변경·저장·내보내기·이름 변경·부품 삽입·도면 생성, 선택형 비가시 인스턴스
-- **안전장치:** 읽기 우선, 기본값 `dry_run=true`, 사전조건 해시(`PLAN_STALE`), 이름 변경·덮어쓰기 전 백업, 저장 범위 화이트리스트(`only_under`), 삭제는 전수 목록을 낸 plan으로만, 사용자 문서를 열거나 닫지 않음
-- **크기:** 도구 13개, 세션당 도구 스키마 약 8,000자, 백그라운드 COM 스레드 1개
-- **요구 사항:** Windows, SolidWorks 2024(SP5에서 확인), Python 3.12, `pywin32`, `mcp>=2,<3`
-
-### 이런 일에 씁니다
-
-- **BOM·사양 추출:** "이 어셈블리의 부품을 재질·SPEC·실제 수량과 함께 정리해줘" → `sw_bom` 한 번으로 끝나고 수량 불일치는 표시됩니다.
-- **속성 정리:** "모든 파트의 DATE를 오늘로, QT'Y를 실제 개수로" → `sw_set_properties` dry-run으로 변경 목록을 보고 적용한 뒤 `sw_save`.
-- **부품 번호 당기기:** "4번이 빠졌으니 5~11번을 한 칸씩 앞으로" → `sw_rename_document`가 부품마다 백업과 참조 갱신을 함께 처리합니다.
-- **LLM 설계 검토:** `sw_snapshot`과 `sw_summary`가 이미지와 수치를 넘겨주므로 모델이 구조·하중·법규 적합성을 따져볼 수 있습니다.
-- **일괄 내보내기:** 협력사용 STEP, 검토용 PDF 도면 — `sw_export`는 쓴 파일을 매번 검증합니다.
-
-### 쓰기 절차
-
-1. 쓰기 도구를 `dry_run=true`(기본값)로 부릅니다. `plan_id`와 변경 전후 값, 바뀔 파일 목록이 돌아옵니다. plan은 10분 뒤 만료됩니다.
-2. 같은 도구를 `dry_run=false, plan_id=...`로 다시 부릅니다. 서버가 현재 값을 다시 읽어 plan과 다르면 `PLAN_STALE`을 돌려주고 쓰지 않습니다. 성공하면 메모리 안의 모델만 바꾸고 `change_set_id`를 돌려줍니다.
-3. `sw_save(change_set_id)`를 부릅니다. 문서는 파트 → 어셈블리 → 도면 순서로 저장됩니다. 이 단계 전까지는 SolidWorks의 Ctrl+Z로 전부 되돌릴 수 있습니다.
-
-이름 변경과 덮어쓰기는 원본 파일을 `_backup/<타임스탬프>/`에 `manifest.json`(경로·SHA-256·관련 문서)과 함께 복사한 뒤 진행합니다.
-
-### 자주 묻는 질문
-
-**SolidWorks 2023이나 2025에서도 되나요?**
-SolidWorks 2024 타입 라이브러리(`sldworks.tlb`, 메이저 버전 32) 기준으로 작성됐습니다. 다른 버전은 `sw/api.py`의 타입 라이브러리 버전 상수를 바꿔야 합니다. COM 호출 자체는 오래된 API 멤버라 대부분 그대로 동작합니다.
-
-**SolidWorks를 실행해 주나요?**
-아니요. Running Object Table을 통해 이미 실행 중인 세션에 붙습니다. 예외는 `sw_background`뿐인데, 이것도 SolidWorks 프로세스가 하나도 없을 때만 비가시 인스턴스를 띄웁니다.
-
-**묻지 않고 모델을 바꾸는 일이 있나요?**
-없습니다. 모든 쓰기 도구는 기본값이 `dry_run=true`이고 `sw_save`를 부르기 전에는 디스크에 아무것도 쓰지 않습니다.
-
-**comtypes 대신 pywin32를 쓴 이유는?**
-comtypes가 생성하는 모듈이 한국어(CP949) 로케일에서 import에 실패합니다. makepy 기반 pywin32 조기 바인딩은 안정적으로 동작합니다.
-
-**열린 문서가 수백 개여도 빠른가요?**
-열린 문서 348개를 열거하는 데 0.5~2초가 걸립니다. 문서마다 `IModelDoc2`로 캐스팅(약 27 ms)하지 않고 `GetDocuments()`와 동적 속성 접근(약 0.3 ms)을 쓰는 것이 비결입니다.
-
-**주의할 점이 있나요?**
-SolidWorks에 모달 대화상자가 떠 있으면 모든 COM 호출이 멈추므로 서버는 일정 시간 뒤 `BUSY`를 돌려줍니다. SolidWorks 인스턴스는 하나만 띄우세요. 두 번째 인스턴스는 호출을 크게 늦추고 연결을 가로챌 수 있습니다.
-
-설치·등록·테스트 방법은 위 영문 섹션과 같고 설계 상세는 `docs/design.md`에 있습니다. 라이선스는 MIT입니다.
+License: MIT. 원 저작권·라이선스 파일은 유지한다.
