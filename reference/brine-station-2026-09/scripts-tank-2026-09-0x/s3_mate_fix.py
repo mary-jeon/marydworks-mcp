@@ -1,0 +1,106 @@
+import sys, os; sys.stdout.reconfigure(encoding='utf-8')
+from sw import api, read, write; from sw.models import DocSelector; from sw.selectors import resolve
+D = os.path.normpath('Z:/28. <PROJECT_NAME>/1_Modeling/S_BrineCharge Station')
+app = api.get_app()
+rotated = False
+# 어셈블리
+am,_ = resolve(app, DocSelector(path=os.path.join(D,'S30000MU0.SLDASM')))
+a = api.cast('IAssemblyDoc', am); aext = api.cast('IModelDocExtension', am.Extension)
+api.activate(app, am); am.ForceRebuild3(False)
+cm = api.cast('IConfigurationManager', am.ConfigurationManager); root = api.cast('IComponent2', api.cast('IConfiguration', cm.ActiveConfiguration).GetRootComponent3(True))
+def comps(): return {api.cast('IComponent2', c).Name2: api.cast('IComponent2', c) for c in root.GetChildren() or []}
+C = comps(); smgr = api.cast('ISelectionMgr', am.SelectionManager)
+ST = {1:'?',2:'미구속',3:'완전정의',4:'과구속',5:'해없음',6:'무효'}
+covN = next(n for n in C if n.startswith('S30008MU0-')); lidN = next(n for n in C if n.startswith('S30006MU0-'))
+if rotated:
+    # 180도 회전 재삽입 필요: 기존 덮개 삭제 후 회전 삽입
+    old_mates=[]
+    f = api.cast('IFeature', am.FirstFeature())
+    while f:
+        if f.GetTypeName2()=='MateGroup':
+            s = api.cast('IFeature', f.GetFirstSubFeature())
+            while s:
+                m2 = api.cast('IMate2', s.GetSpecificFeature2())
+                for i in range(m2.GetMateEntityCount()):
+                    e = api.cast('IMateEntity2', m2.MateEntity(i)); c = e.ReferenceComponent
+                    if c is not None and api.cast('IComponent2', c).Name2.startswith('S30008'): old_mates.append(s.Name); break
+                s = api.cast('IFeature', s.GetNextSubFeature())
+        f = api.cast('IFeature', f.GetNextFeature())
+    for nm in old_mates:
+        am.ClearSelection2(True)
+        if aext.SelectByID2(nm, 'MATE', 0,0,0, False, 0, None, 0): aext.DeleteSelection2(0)
+    am.ClearSelection2(True)
+    if aext.SelectByID2(covN + '@S30000MU0', 'COMPONENT', 0,0,0, False, 0, None, 0): aext.DeleteSelection2(0)
+    am.ForceRebuild3(False)
+    a.AddComponents3(VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_BSTR, [os.path.join(D,'S30008MU0.SLDPRT')]),
+                     VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_R8, [1,0,0, 0,-1,0, 0,0,-1, -0.2375, 0.7725, -0.2375, 1,0,0,0]),
+                     VARIANT(pythoncom.VT_ARRAY|pythoncom.VT_BSTR, ['']))
+    am.ForceRebuild3(False); C = comps()
+    covN = next(n for n in C if n.startswith('S30008MU0-'))
+    curbN = next(n for n in C if n.startswith('S30007MU0-'))
+    for pl in ('정면','우측면'):
+        am.ClearSelection2(True)
+        ok1 = aext.SelectByID2(pl + '@' + covN + '@S30000MU0', 'PLANE', 0,0,0, False, 1, None, 0)
+        ok2 = aext.SelectByID2(pl + '@' + curbN + '@S30000MU0', 'PLANE', 0,0,0, True, 1, None, 0)
+        r = a.AddMate5(0, 2, False, 0,0,0, 1,1, 0,0,0, False, False, 0)
+        m2, err = (r[0], int(r[1])) if isinstance(r, tuple) else (r, -1)
+        print('덮개(회전)', pl, '정렬 err', err)
+    am.ForceRebuild3(False)
+def faces_of(c):
+    T = list(api.cast('IMathTransform', c.Transform2).ArrayData); R=[T[0:3],T[3:6],T[6:9]]; t=T[9:12]; out=[]
+    for fx in api.cast('IBody2', c.GetBody()).GetFaces() or []:
+        fx = api.cast('IFace2', fx); s = api.cast('ISurface', fx.GetSurface())
+        if not s.IsPlane(): continue
+        n = list(fx.Normal); n=[round(sum(n[k]*R[k][i] for k in range(3)),2) for i in range(3)]
+        b = list(fx.GetBox()); pts=[[sum(p[k]*R[k][i] for k in range(3))+t[i] for i in range(3)] for p in [(b[i],b[j],b[k]) for i in (0,3) for j in (1,4) for k in (2,5)]]
+        cen=[round(sum(p[i] for p in pts)/8*1000,1) for i in range(3)]; out.append({'face':fx,'n':n,'c':cen,'A':round(fx.GetArea()*1e6)})
+    return out
+def all_bodies_faces(c):
+    out=[]
+    T = list(api.cast('IMathTransform', c.Transform2).ArrayData); R=[T[0:3],T[3:6],T[6:9]]; t=T[9:12]
+    for bo in c.GetBodies3(0, None) or []:
+        for fx in api.cast('IBody2', bo).GetFaces() or []:
+            fx = api.cast('IFace2', fx); s = api.cast('ISurface', fx.GetSurface())
+            if not s.IsPlane(): continue
+            n = list(fx.Normal); n=[round(sum(n[k]*R[k][i] for k in range(3)),2) for i in range(3)]
+            b = list(fx.GetBox()); pts=[[sum(p[k]*R[k][i] for k in range(3))+t[i] for i in range(3)] for p in [(b[i],b[j],b[k]) for i in (0,3) for j in (1,4) for k in (2,5)]]
+            cen=[round(sum(p[i] for p in pts)/8*1000,1) for i in range(3)]; out.append({'face':fx,'n':n,'c':cen,'A':round(fx.GetArea()*1e6)})
+    return out
+def rollback_last():
+    f = api.cast('IFeature', am.FirstFeature()); last=None
+    while f:
+        if f.GetTypeName2()=='MateGroup':
+            s = api.cast('IFeature', f.GetFirstSubFeature())
+            while s: last=s.Name; s = api.cast('IFeature', s.GetNextSubFeature())
+        f = api.cast('IFeature', f.GetNextFeature())
+    am.ClearSelection2(True)
+    if aext.SelectByID2(last, 'MATE', 0,0,0, False, 0, None, 0): aext.DeleteSelection2(0)
+    print('   롤백', last)
+for align, flip in [(1,False),(1,True),(0,False),(0,True)]:
+    if C[covN].GetConstrainedStatus() == 3: break
+    try: cov_faces = all_bodies_faces(C[covN])
+    except Exception: cov_faces = faces_of(C[covN])
+    cb_c = [fx for fx in cov_faces if fx['n']==[0,-1,0]]
+    lt_c = [fx for fx in faces_of(C[lidN]) if fx['n']==[0,1,0] and abs(fx['c'][1]-740)<1]
+    cb = min(cb_c, key=lambda fx: fx['c'][1]); lt = max(lt_c, key=lambda fx: fx['A'])
+    am.ClearSelection2(True); sd = api.cast('ISelectData', smgr.CreateSelectData()); sd.Mark=1
+    api.cast('IEntity', cb['face']).Select4(False, sd); api.cast('IEntity', lt['face']).Select4(True, sd)
+    r = a.AddMate5(5, align, flip, 0.0125, 0.0125, 0.0125, 1,1, 0,0,0, False, False, 0)
+    m2, err = (r[0], int(r[1])) if isinstance(r, tuple) else (r, -1)
+    am.ForceRebuild3(False)
+    b = [round(v*1000,1) for v in C[covN].GetBox(False, False)]
+    ok = (m2 is not None and err==1 and abs(b[4]-772.5)<0.3 and abs(b[1]-752.5)<0.3)
+    print('덮개 거리27.5 align', align, 'flip', flip, 'err', err, 'box', b, '채택' if ok else '')
+    if ok: break
+    if m2 is not None: rollback_last(); am.ForceRebuild3(False)
+am.ForceRebuild3(False)
+print('오류:', aext.GetWhatsWrongCount())
+print('상태:', {n: ST.get(c.GetConstrainedStatus()) for n, c in comps().items()})
+r2 = read.audit(DocSelector(path=os.path.join(D,'S30000MU0.SLDASM')), None, True, 200, 120)
+print('간섭:', [(i['components'], round(i['volume_mm3'],1)) for i in r2.get('interferences', [])])
+for d in api.list_docs(app, with_raw=True, light=False):
+    if d.get('dirty') and d['title'].upper().startswith('S300'):
+        mm = api.cast('IModelDoc2', d['_raw']); print('save', d['title'], write.save_model(app, mm)['errors'])
+S = r'<HOME>\AppData\Local\Temp\claude\Z--28------------------------------1-Modeling-S-BrineCharge-Station\fce0f6b5-cb07-4e3d-8de8-d54e6221bcfb\scratchpad\s3'
+read.snapshot(DocSelector(path=os.path.join(D,'S30000MU0.SLDASM')), ['iso','front'], S)
+print('snap ok')
